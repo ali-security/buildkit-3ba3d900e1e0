@@ -27,6 +27,7 @@ import (
 	"github.com/moby/buildkit/solver/pb"
 	"github.com/moby/buildkit/source"
 	srctypes "github.com/moby/buildkit/source/types"
+	"github.com/moby/buildkit/source/util/pathutil"
 	"github.com/moby/buildkit/util/bklog"
 	"github.com/moby/buildkit/util/cachedigest"
 	"github.com/moby/buildkit/util/tracing"
@@ -511,9 +512,17 @@ func (hs *httpSourceHandler) save(ctx context.Context, resp *http.Response, s se
 	if hs.src.Perm != 0 {
 		perm = hs.src.Perm
 	}
-	fp := filepath.Join(dir, getFileName(hs.src.URL, hs.src.Filename, resp))
 
-	f, err := os.OpenFile(fp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, os.FileMode(perm))
+	name := getFileName(hs.src.URL, hs.src.Filename, resp)
+	fp := filepath.Join(dir, name)
+
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		return nil, "", err
+	}
+	defer root.Close()
+
+	f, err := root.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, os.FileMode(perm))
 	if err != nil {
 		return nil, "", err
 	}
@@ -529,11 +538,6 @@ func (hs *httpSourceHandler) save(ctx context.Context, resp *http.Response, s se
 		return nil, "", err
 	}
 
-	if err := f.Close(); err != nil {
-		return nil, "", err
-	}
-	f = nil
-
 	uid := hs.src.UID
 	gid := hs.src.GID
 	if idmap := mount.IdentityMapping(); idmap != nil {
@@ -543,11 +547,19 @@ func (hs *httpSourceHandler) save(ctx context.Context, resp *http.Response, s se
 		}
 	}
 
+	// Change ownership through the descriptor opened inside root instead of
+	// re-resolving the path, so the chown cannot be redirected outside of dir.
+	// os.Root.Chown would be the direct equivalent but requires go1.25.
 	if gid != 0 || uid != 0 {
-		if err := os.Chown(fp, uid, gid); err != nil {
+		if err := f.Chown(uid, gid); err != nil {
 			return nil, "", err
 		}
 	}
+
+	if err := f.Close(); err != nil {
+		return nil, "", err
+	}
+	f = nil
 
 	mTime := time.Unix(0, 0)
 	lastMod := resp.Header.Get("Last-Modified")
@@ -721,14 +733,14 @@ func (hs *httpSourceHandler) newHTTPRequest(ctx context.Context, g session.Group
 
 func getFileName(urlStr, manualFilename string, resp *http.Response) string {
 	if manualFilename != "" {
-		return manualFilename
+		return pathutil.SafeFileName(manualFilename)
 	}
 	if resp != nil {
 		if contentDisposition := resp.Header.Get("Content-Disposition"); contentDisposition != "" {
 			if _, params, err := mime.ParseMediaType(contentDisposition); err == nil {
 				if params["filename"] != "" && !strings.HasSuffix(params["filename"], "/") {
 					if filename := filepath.Base(filepath.FromSlash(params["filename"])); filename != "" {
-						return filename
+						return pathutil.SafeFileName(filename)
 					}
 				}
 			}
@@ -737,10 +749,10 @@ func getFileName(urlStr, manualFilename string, resp *http.Response) string {
 	u, err := url.Parse(urlStr)
 	if err == nil {
 		if base := path.Base(u.Path); base != "." && base != "/" {
-			return base
+			return pathutil.SafeFileName(base)
 		}
 	}
-	return "download"
+	return pathutil.SafeFileName("")
 }
 
 func searchHTTPURLDigest(ctx context.Context, store cache.MetadataStore, dgst digest.Digest) ([]cacheRefMetadata, error) {
