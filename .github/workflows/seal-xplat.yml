@@ -1,0 +1,232 @@
+name: seal-xplat
+
+# Sealed-build workflow for the ali-security fork. Upstream has no workflow
+# that produces the Go module zip, and its test workflow (test-os.yml) cannot
+# run on a fork (Buildx bake + GHA cache, CODECOV_TOKEN, no macOS leg), so
+# this one builds the module zip and runs the unit suite on linux, windows
+# and macOS.
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "go test -run regexp (empty = full suite)"
+        required: false
+        default: ""
+
+env:
+  # upstream test-os.yml pins Go 1.25 (go.mod declares go 1.24.3)
+  GO_VERSION: "1.25"
+  # Skip report over a `go test -v` log: prints every `--- SKIP` line with the
+  # t.Skip/t.Log lines that test emitted (go -v streams those BEFORE the
+  # `--- SKIP` line, or after it for subtests), then the pass/skip/fail counts.
+  TEST_REPORT_AWK: |
+    /^=== RUN/ { cur = $3; buf[cur] = ""; after = 0; next }
+    /^=== (CONT|NAME|PAUSE)/ { cur = $3; after = 0; next }
+    /^ *--- SKIP:/ { name = $3; print; if (name in buf) printf "%s", buf[name]; after = 1; s++; next }
+    /^ +[^ ].*\.go:[0-9]+:/ { if (after) { print; next } if (cur != "") buf[cur] = buf[cur] $0 "\n"; next }
+    /^ *--- PASS:/ { p++ }
+    /^ *--- FAIL:/ { f++ }
+    { after = 0 }
+    END { printf "passed tests: %d, skipped tests: %d, failed tests: %d\n", p, s, f }
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  module-zip:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      -
+        name: Checkout
+        uses: actions/checkout@v5
+      -
+        name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "${{ env.GO_VERSION }}"
+          cache: false
+      -
+        name: Compile gate
+        run: |
+          set -eux
+          go build ./...
+      -
+        # golang.org/x/mod/zip.CreateFromDir applies the module proxy's own
+        # inclusion rules, so the file set matches the published zip by
+        # construction. The helper lives outside the checkout, and the zip is
+        # packed from a copy of the tree without this added seal-xplat.yml,
+        # so neither ships in the module zip.
+        name: Build module zip
+        run: |
+          set -eux
+          mkdir -p "$RUNNER_TEMP/helper" "$RUNNER_TEMP/out" "$RUNNER_TEMP/src"
+          cp -a "$GITHUB_WORKSPACE/." "$RUNNER_TEMP/src/"
+          rm -rf "$RUNNER_TEMP/src/.git"
+          rm -f "$RUNNER_TEMP/src/.github/workflows/seal-xplat.yml"
+          cat > "$RUNNER_TEMP/helper/create_mod.go" <<'EOF'
+          package main
+
+          import (
+              "log"
+              "os"
+
+              "golang.org/x/mod/module"
+              "golang.org/x/mod/zip"
+          )
+
+          func main() {
+              if len(os.Args) != 5 {
+                  log.Fatal("usage: create_mod <module-path> <version> <source-dir> <output-zip>")
+              }
+              m := module.Version{Path: os.Args[1], Version: os.Args[2]}
+              f, err := os.Create(os.Args[4])
+              if err != nil {
+                  log.Fatal(err)
+              }
+              defer f.Close()
+              if err := zip.CreateFromDir(f, m, os.Args[3]); err != nil {
+                  log.Fatal(err)
+              }
+              log.Printf("created module zip: %s", os.Args[4])
+          }
+          EOF
+          cd "$RUNNER_TEMP/helper"
+          go mod init example.com/mod
+          GOFLAGS=-mod=mod go get golang.org/x/mod@v0.24.0
+          GOFLAGS=-mod=mod go run ./create_mod.go github.com/moby/buildkit v0.26.3 "$RUNNER_TEMP/src" "$RUNNER_TEMP/out/v0.26.3.zip"
+          unzip -l "$RUNNER_TEMP/out/v0.26.3.zip" | tail -3
+      -
+        name: Upload module zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: module-zip
+          path: ${{ runner.temp }}/out/v0.26.3.zip
+          if-no-files-found: error
+
+  test-linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      -
+        name: Checkout
+        uses: actions/checkout@v5
+      -
+        name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "${{ env.GO_VERSION }}"
+          cache: false
+      -
+        name: Signing fixtures + registry binary
+        run: |
+          set -eux
+          # (a) GPG + SSH signing fixtures for user1/user2 (read by source/git
+          #     and client tests via BUILDKIT_TEST_SIGN_FIXTURES), generated AS
+          #     ROOT so the keys belong to the root user that runs the tests.
+          #     The runner's sudo ignores -E, so every variable root needs is
+          #     passed explicitly through env.
+          export BUILDKIT_TEST_SIGN_FIXTURES="$RUNNER_TEMP/sign-fixtures"
+          sudo env "PATH=$PATH" "BUILDKIT_TEST_SIGN_FIXTURES=$BUILDKIT_TEST_SIGN_FIXTURES" sh hack/fixtures/gen_gpg_test_env.sh user1
+          sudo env "PATH=$PATH" "BUILDKIT_TEST_SIGN_FIXTURES=$BUILDKIT_TEST_SIGN_FIXTURES" sh hack/fixtures/gen_gpg_test_env.sh user2
+          sudo env "PATH=$PATH" "BUILDKIT_TEST_SIGN_FIXTURES=$BUILDKIT_TEST_SIGN_FIXTURES" sh hack/fixtures/gen_ssh_test_env.sh user1
+          sudo env "PATH=$PATH" "BUILDKIT_TEST_SIGN_FIXTURES=$BUILDKIT_TEST_SIGN_FIXTURES" sh hack/fixtures/gen_ssh_test_env.sh user2
+          # (b) the generated *.git_ssh_sign.sh ends with `mv "$buf.sig" "$out"`
+          #     where out == "$buf.sig"; GNU mv aborts on "same file" and kills
+          #     every signed test commit. Guard the mv.
+          sudo find "$BUILDKIT_TEST_SIGN_FIXTURES" -name '*.git_ssh_sign.sh' -print0 \
+            | xargs -0 -r sudo sed -i 's#^mv "\$buf.sig" "\$out"$#[ "\$buf.sig" = "\$out" ] || mv "\$buf.sig" "\$out"#'
+          echo "BUILDKIT_TEST_SIGN_FIXTURES=$BUILDKIT_TEST_SIGN_FIXTURES" >> "$GITHUB_ENV"
+          # (c) worker/containerd and worker/runc TestMain panic with a nil
+          #     flock in RunMirror's error path unless a CNCF `registry`
+          #     binary is on PATH.
+          ctr=$(docker create registry:3)
+          docker cp "$ctr:/bin/registry" "$RUNNER_TEMP/registry"
+          docker rm "$ctr"
+          sudo install -m 0755 "$RUNNER_TEMP/registry" /usr/local/bin/registry
+      -
+        # Root is required: many packages exercise mount syscalls needing
+        # CAP_SYS_ADMIN. The whole unfiltered ./... runs here, no exclusions.
+        name: Test
+        run: |
+          set -eux
+          sudo env "PATH=$PATH" "GOTOOLCHAIN=local" "BUILDKIT_TEST_SIGN_FIXTURES=$BUILDKIT_TEST_SIGN_FIXTURES" go test -short -v -run "${{ inputs.test-filter }}" ./... 2>&1 | tee "$RUNNER_TEMP/test.log"
+          # every skipped test with its skip reason, then the pass/skip/fail counts
+          awk "$TEST_REPORT_AWK" "$RUNNER_TEMP/test.log"
+
+  test-windows:
+    runs-on: windows-latest
+    timeout-minutes: 50
+    steps:
+      -
+        name: Checkout
+        uses: actions/checkout@v5
+      -
+        name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "${{ env.GO_VERSION }}"
+          cache: false
+      -
+        # TestCacheMountLockedRefs (solver/llbsolver/mounts) has cache-mount
+        # unlock semantics incompatible with Windows. Nothing else is skipped.
+        name: Test
+        run: |
+          set -eux
+          go test -short -v -skip '^TestCacheMountLockedRefs$' -run "${{ inputs.test-filter }}" ./... 2>&1 | tee "$RUNNER_TEMP/test.log"
+          # every skipped test with its skip reason, then the pass/skip/fail counts
+          awk "$TEST_REPORT_AWK" "$RUNNER_TEMP/test.log"
+
+  test-macos:
+    runs-on: macos-latest
+    timeout-minutes: 50
+    steps:
+      -
+        name: Checkout
+        uses: actions/checkout@v5
+      -
+        name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "${{ env.GO_VERSION }}"
+          cache: false
+      -
+        # BSD sed breaks the fixture scripts' `sed -i` invocations; put GNU
+        # sed first on PATH.
+        name: Install GNU sed
+        run: |
+          set -eux
+          brew install gnu-sed
+          echo "$(brew --prefix gnu-sed)/libexec/gnubin" >> "$GITHUB_PATH"
+      -
+        name: Signing fixtures
+        run: |
+          set -eux
+          export BUILDKIT_TEST_SIGN_FIXTURES="$RUNNER_TEMP/sign-fixtures"
+          sudo -E env "PATH=$PATH" sh hack/fixtures/gen_gpg_test_env.sh user1
+          sudo -E env "PATH=$PATH" sh hack/fixtures/gen_gpg_test_env.sh user2
+          sudo -E env "PATH=$PATH" sh hack/fixtures/gen_ssh_test_env.sh user1
+          sudo -E env "PATH=$PATH" sh hack/fixtures/gen_ssh_test_env.sh user2
+          sudo find "$BUILDKIT_TEST_SIGN_FIXTURES" -name '*.git_ssh_sign.sh' -print0 \
+            | xargs -0 -r sudo sed -i 's#^mv "\$buf.sig" "\$out"$#[ "\$buf.sig" = "\$out" ] || mv "\$buf.sig" "\$out"#'
+          echo "BUILDKIT_TEST_SIGN_FIXTURES=$BUILDKIT_TEST_SIGN_FIXTURES" >> "$GITHUB_ENV"
+      -
+        # buildkit does not implement these five packages on darwin
+        # (snapshot/localmounter_darwin.go returns "not implemented" for bind
+        # mounts, and containerd has no darwin build); upstream runs ZERO macOS
+        # CI. Excluded here as upstream-unimplemented darwin platform surface:
+        #   github.com/moby/buildkit/cache
+        #   github.com/moby/buildkit/cache/contenthash
+        #   github.com/moby/buildkit/source/git
+        #   github.com/moby/buildkit/source/http
+        #   github.com/moby/buildkit/worker/containerd
+        # All five DO run on the linux and windows legs, so coverage is kept.
+        name: Test
+        run: |
+          set -eux
+          pkgs=$(go list ./... | grep -v -E '^github.com/moby/buildkit/(cache|cache/contenthash|source/git|source/http|worker/containerd)$')
+          sudo -E env "PATH=$PATH" go test -short -v -run "${{ inputs.test-filter }}" $pkgs 2>&1 | tee "$RUNNER_TEMP/test.log"
+          # every skipped test with its skip reason, then the pass/skip/fail counts
+          awk "$TEST_REPORT_AWK" "$RUNNER_TEMP/test.log"
